@@ -1,6 +1,7 @@
 """
 Weather Data Processing Pipeline for Parks Canada
-Fetches, cleans, and aggregates weather data from multiple sources.
+Fetches, cleans, aggregates, and imputes weather data from multiple sources.
+VERSION: 2.5 - With 25% Threshold + Data Quality + Dew Bounds Check
 """
 import pandas as pd
 import gc
@@ -29,8 +30,20 @@ CONFIG = {
     'OUTPUT_ALL_DATA': 'PEINP_all_weather_data.csv',
     'OUTPUT_HOURLY': 'PEINP_hourly_weather_data.csv',
     'OUTPUT_DAILY': 'PEINP_daily_weather_data.csv',
+    'OUTPUT_DATA_QUALITY': 'PEINP_data_quality_report.csv',
     'CACHE_DIR': 'cache',
-    'MAX_WORKERS': 4
+    'MAX_WORKERS': 4,
+    # Imputation settings
+    'INTERPOLATE_LIMIT_HOURS': 3,
+    'FORWARD_FILL_LIMIT_HOURS': 6,
+    'BACKWARD_FILL_LIMIT_HOURS': 3,
+    'IMPUTATION_THRESHOLD_PCT': 25.0,  # Don't impute if >25% missing
+    'TEMP_MIN': -40,  # PEI reasonable bounds (°C)
+    'TEMP_MAX': 40,
+    'RH_MIN': 0,
+    'RH_MAX': 100,
+    'DEW_MIN': -100,  # Dew point reasonable bounds (°C)
+    'DEW_MAX': 100,
 }
 
 # ============================================================================
@@ -448,6 +461,157 @@ def generate_data_quality_report(df, stage=""):
 
     logger.info(f"{'='*60}\n")
 
+def create_data_quality_csv(df):
+    """
+    Create comprehensive data quality report CSV with statistics.
+
+    Shows missing values, imputation counts, and statistical measures by station and column.
+
+    Args:
+        df: DataFrame with weather data and imputation flags
+
+    Returns:
+        DataFrame with data quality metrics
+    """
+    logger.info("Creating data quality report with statistics...")
+
+    # Get all data columns (not imputation flags)
+    data_cols = [c for c in df.columns 
+                if c not in ['Datetime_UTC', 'station'] 
+                and not c.endswith('_imputed')]
+
+    # Build report rows
+    report_rows = []
+
+    for station in sorted(df['station'].unique()):
+        station_df = df[df['station'] == station]
+        total_rows = len(station_df)
+
+        for col in data_cols:
+            if col not in station_df.columns:
+                continue
+
+            # Count missing values
+            missing_count = station_df[col].isnull().sum()
+            missing_pct = (missing_count / total_rows * 100) if total_rows > 0 else 0
+
+            # Count imputation types if flag column exists
+            flag_col = f'{col}_imputed'
+            if flag_col in station_df.columns:
+                imputed_0_original = (station_df[flag_col] == 0).sum()
+                imputed_1_interpolated = (station_df[flag_col] == 1).sum()
+                imputed_2_forward_back = (station_df[flag_col] == 2).sum()
+                imputed_3_calculated = (station_df[flag_col] == 3).sum()
+                total_imputed = imputed_1_interpolated + imputed_2_forward_back + imputed_3_calculated
+            else:
+                imputed_0_original = total_rows - missing_count
+                imputed_1_interpolated = 0
+                imputed_2_forward_back = 0
+                imputed_3_calculated = 0
+                total_imputed = 0
+
+            # Calculate statistics on non-missing values
+            valid_data = station_df[col].dropna()
+            if len(valid_data) > 0:
+                mean_val = valid_data.mean()
+                median_val = valid_data.median()
+                min_val = valid_data.min()
+                max_val = valid_data.max()
+                q1_val = valid_data.quantile(0.25)
+                q3_val = valid_data.quantile(0.75)
+                iqr_val = q3_val - q1_val
+            else:
+                mean_val = median_val = min_val = max_val = q1_val = q3_val = iqr_val = np.nan
+
+            report_rows.append({
+                'station': station,
+                'column': col,
+                'total_rows': total_rows,
+                'missing_count': missing_count,
+                'missing_percent': round(missing_pct, 2),
+                'original_data_count': imputed_0_original,
+                'interpolated_count': imputed_1_interpolated,
+                'forward_backward_filled_count': imputed_2_forward_back,
+                'calculated_count': imputed_3_calculated,
+                'total_imputed_count': total_imputed,
+                'imputation_percent': round((total_imputed / total_rows * 100) if total_rows > 0 else 0, 2),
+                'mean': round(mean_val, 2) if not np.isnan(mean_val) else np.nan,
+                'median': round(median_val, 2) if not np.isnan(median_val) else np.nan,
+                'min': round(min_val, 2) if not np.isnan(min_val) else np.nan,
+                'max': round(max_val, 2) if not np.isnan(max_val) else np.nan,
+                'q1': round(q1_val, 2) if not np.isnan(q1_val) else np.nan,
+                'q3': round(q3_val, 2) if not np.isnan(q3_val) else np.nan,
+                'iqr': round(iqr_val, 2) if not np.isnan(iqr_val) else np.nan,
+            })
+
+    # Add summary row for each column across all stations
+    summary_rows = []
+    for col in data_cols:
+        if col not in df.columns:
+            continue
+
+        total_rows = len(df)
+        missing_count = df[col].isnull().sum()
+        missing_pct = (missing_count / total_rows * 100) if total_rows > 0 else 0
+
+        flag_col = f'{col}_imputed'
+        if flag_col in df.columns:
+            imputed_0_original = (df[flag_col] == 0).sum()
+            imputed_1_interpolated = (df[flag_col] == 1).sum()
+            imputed_2_forward_back = (df[flag_col] == 2).sum()
+            imputed_3_calculated = (df[flag_col] == 3).sum()
+            total_imputed = imputed_1_interpolated + imputed_2_forward_back + imputed_3_calculated
+        else:
+            imputed_0_original = total_rows - missing_count
+            imputed_1_interpolated = 0
+            imputed_2_forward_back = 0
+            imputed_3_calculated = 0
+            total_imputed = 0
+
+        # Calculate statistics across all stations
+        valid_data = df[col].dropna()
+        if len(valid_data) > 0:
+            mean_val = valid_data.mean()
+            median_val = valid_data.median()
+            min_val = valid_data.min()
+            max_val = valid_data.max()
+            q1_val = valid_data.quantile(0.25)
+            q3_val = valid_data.quantile(0.75)
+            iqr_val = q3_val - q1_val
+        else:
+            mean_val = median_val = min_val = max_val = q1_val = q3_val = iqr_val = np.nan
+
+        summary_rows.append({
+            'station': 'ALL_STATIONS',
+            'column': col,
+            'total_rows': total_rows,
+            'missing_count': missing_count,
+            'missing_percent': round(missing_pct, 2),
+            'original_data_count': imputed_0_original,
+            'interpolated_count': imputed_1_interpolated,
+            'forward_backward_filled_count': imputed_2_forward_back,
+            'calculated_count': imputed_3_calculated,
+            'total_imputed_count': total_imputed,
+            'imputation_percent': round((total_imputed / total_rows * 100) if total_rows > 0 else 0, 2),
+            'mean': round(mean_val, 2) if not np.isnan(mean_val) else np.nan,
+            'median': round(median_val, 2) if not np.isnan(median_val) else np.nan,
+            'min': round(min_val, 2) if not np.isnan(min_val) else np.nan,
+            'max': round(max_val, 2) if not np.isnan(max_val) else np.nan,
+            'q1': round(q1_val, 2) if not np.isnan(q1_val) else np.nan,
+            'q3': round(q3_val, 2) if not np.isnan(q3_val) else np.nan,
+            'iqr': round(iqr_val, 2) if not np.isnan(iqr_val) else np.nan,
+        })
+
+    summary_df = pd.DataFrame(summary_rows)
+
+    # Combine station-specific and summary data
+    quality_df = pd.DataFrame(report_rows)
+    quality_df = pd.concat([quality_df, summary_df], ignore_index=True)
+
+    logger.info(f"Data quality report complete: {len(quality_df)} rows")
+
+    return quality_df
+
 # ============================================================================
 # DATA PROCESSING
 # ============================================================================
@@ -522,8 +686,7 @@ def clean_weather_data(df):
 
     # Drop unwanted columns (including Precipitation)
     drop_cols = ['Hmdx', 'Wind Chill', 'Day', 'Water Pressure', 'Diff Pressure', 
-                'Barometric Pressure', 'Water Temperature', 'Water Level', 'Solar Radiation',
-                'Precipitation']
+                'Barometric Pressure', 'Water Temperature', 'Water Level', 'Solar Radiation']
     existing_drop_cols = [c for c in drop_cols if c in df.columns]
     if existing_drop_cols:
         df = df.drop(columns=existing_drop_cols)
@@ -558,6 +721,293 @@ def clean_weather_data(df):
     df['station'] = df['station'].astype('category')
 
     logger.info("Data cleaning complete")
+
+    return df
+
+# ============================================================================
+# IMPUTATION FUNCTIONS
+# ============================================================================
+
+def calculate_rh_from_temp_dew(temp, dew):
+    """
+    Calculate relative humidity from temperature and dew point using Magnus formula.
+
+    Args:
+        temp: Temperature in Celsius
+        dew: Dew point in Celsius
+
+    Returns:
+        Relative humidity as percentage (0-100)
+    """
+    # Magnus formula constants
+    a = 17.625
+    b = 243.04
+
+    # Calculate vapor pressures
+    try:
+        vapor_pressure_dew = np.exp((a * dew) / (b + dew))
+        vapor_pressure_temp = np.exp((a * temp) / (b + temp))
+        rh = 100 * (vapor_pressure_dew / vapor_pressure_temp)
+
+        # Clip to valid range
+        rh = np.clip(rh, 0, 100)
+        return rh
+    except:
+        return np.nan
+
+def impute_missing_values(df):
+    """
+    Implement tiered imputation strategy for weather data.
+
+    NEW: Skip imputation for station-column combinations with ≥25% missing data.
+
+    Tiers:
+    1. Linear interpolation for gaps < 3 hours
+    2. Forward/backward fill for gaps < 6 hours
+    3. Variable-specific rules (Rain=0, Rh from Temp+Dew, etc.)
+    4. Leave long gaps as NaN (sensor failures)
+
+    Args:
+        df: DataFrame with weather data
+
+    Returns:
+        df: DataFrame with imputed values and imputation flags
+    """
+    logger.info("="*60)
+    logger.info("Starting Missing Data Imputation")
+    logger.info(f"Threshold: Skip imputation if ≥{CONFIG['IMPUTATION_THRESHOLD_PCT']}% missing")
+    logger.info("="*60)
+
+    # Ensure sorted by time within each station
+    df = df.sort_values(['station', 'Datetime_UTC']).reset_index(drop=True)
+
+    # Get all columns except datetime and station
+    numeric_cols = [c for c in df.columns 
+                   if c not in ['Datetime_UTC', 'station'] 
+                   and not c.endswith('_imputed')]
+
+    # Convert to numeric if needed (handles object/category dtypes)
+    for col in numeric_cols:
+        if df[col].dtype == 'object' or df[col].dtype.name == 'category':
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            logger.info(f"Converted {col} from {df[col].dtype} to numeric")
+
+    logger.info(f"Found {len(numeric_cols)} columns to impute: {numeric_cols}")
+
+    # Track statistics
+    imputation_stats = {}
+
+    for col in numeric_cols:
+        original_missing = df[col].isnull().sum()
+        original_pct = (original_missing / len(df)) * 100
+
+        if original_missing == 0:
+            logger.info(f"{col}: No missing values")
+            continue
+
+        logger.info(f"\n{col}: {original_missing:,} missing ({original_pct:.1f}%)")
+
+        # Create imputation flag column
+        # 0 = original data, 1 = interpolated, 2 = forward/backward filled, 3 = calculated/special
+        flag_col = f'{col}_imputed'
+        df[flag_col] = 0
+        df.loc[df[col].isnull(), flag_col] = 1
+
+        # NEW: Check missing percentage per station and decide which to impute
+        stations_to_impute = []
+        stations_to_skip = []
+
+        for station in df['station'].unique():
+            station_mask = df['station'] == station
+            station_total = station_mask.sum()
+            station_missing = df.loc[station_mask, col].isnull().sum()
+            station_missing_pct = (station_missing / station_total * 100) if station_total > 0 else 0
+
+            if station_missing_pct >= CONFIG['IMPUTATION_THRESHOLD_PCT']:
+                stations_to_skip.append(station)
+                logger.info(f"  SKIPPING {station}: {station_missing_pct:.1f}% missing (≥{CONFIG['IMPUTATION_THRESHOLD_PCT']}%)")
+            else:
+                stations_to_impute.append(station)
+
+        if stations_to_skip:
+            logger.info(f"  Imputing for {len(stations_to_impute)} stations, skipping {len(stations_to_skip)}")
+
+        # TIER 1: Linear interpolation for short gaps (< 3 hours)
+        for station in stations_to_impute:
+            mask = df['station'] == station
+            station_df = df.loc[mask].copy()
+
+            # Set datetime index for time-based interpolation
+            station_df = station_df.set_index('Datetime_UTC')
+
+            # Interpolate with time-based method
+            station_df[col] = station_df[col].interpolate(
+                method='time', 
+                limit=CONFIG['INTERPOLATE_LIMIT_HOURS'],
+                limit_direction='both'
+            )
+
+            # Reset index and update original dataframe
+            station_df = station_df.reset_index()
+            df.loc[mask, col] = station_df[col].values
+
+        after_tier1 = df[col].isnull().sum()
+        tier1_imputed = original_missing - after_tier1
+        logger.info(f"  Tier 1 (interpolation): Filled {tier1_imputed:,} values")
+
+        # TIER 2: Forward/backward fill for medium gaps
+        # Only for specific variables that exhibit persistence
+        if col in ['Temperature', 'Dew', 'Rh', 'Wind Speed']:
+            df.loc[df[col].isnull(), flag_col] = 2
+
+            for station in stations_to_impute:
+                mask = df['station'] == station
+                station_df = df.loc[mask].copy()
+
+                # Forward fill
+                station_df[col] = station_df[col].fillna(method='ffill', 
+                                                          limit=CONFIG['FORWARD_FILL_LIMIT_HOURS'])
+                # Backward fill (shorter limit)
+                station_df[col] = station_df[col].fillna(method='bfill',
+                                                          limit=CONFIG['BACKWARD_FILL_LIMIT_HOURS'])
+
+                df.loc[mask, col] = station_df[col].values
+
+            after_tier2 = df[col].isnull().sum()
+            tier2_imputed = after_tier1 - after_tier2
+            logger.info(f"  Tier 2 (forward/back fill): Filled {tier2_imputed:,} values")
+        else:
+            after_tier2 = after_tier1
+            tier2_imputed = 0
+
+        # TIER 3: Variable-specific imputation
+        tier3_imputed = 0
+
+        if col == 'Rain':
+            # Missing rain data almost certainly means no rain
+            # Only impute for stations under threshold
+            for station in stations_to_impute:
+                mask = df['station'] == station
+                missing_rain = df.loc[mask, col].isnull()
+                df.loc[mask & missing_rain, flag_col] = 3
+                df.loc[mask & missing_rain, col] = 0
+
+            after_tier3 = df[col].isnull().sum()
+            tier3_imputed = after_tier2 - after_tier3
+            logger.info(f"  Tier 3 (rain=0): Filled {tier3_imputed:,} values with 0")
+
+        elif col == 'Wind Gust Speed':
+            # If Wind Gust Speed missing but Wind Speed available, use Wind Speed
+            if 'Wind Speed' in df.columns:
+                for station in stations_to_impute:
+                    mask = df['station'] == station
+                    missing_gust = df.loc[mask, col].isnull()
+                    has_wind_speed = df.loc[mask, 'Wind Speed'].notnull()
+                    impute_mask_station = mask & missing_gust & has_wind_speed
+
+                    df.loc[impute_mask_station, flag_col] = 3
+                    df.loc[impute_mask_station, col] = df.loc[impute_mask_station, 'Wind Speed']
+
+                after_tier3 = df[col].isnull().sum()
+                tier3_imputed = after_tier2 - after_tier3
+                logger.info(f"  Tier 3 (gust=wind): Filled {tier3_imputed:,} values")
+            else:
+                after_tier3 = after_tier2
+
+        elif col == 'Rh':
+            # Calculate Rh from Temperature and Dew Point where possible
+            if 'Temperature' in df.columns and 'Dew' in df.columns:
+                for station in stations_to_impute:
+                    mask = df['station'] == station
+                    missing_rh = df.loc[mask, col].isnull()
+                    has_temp_dew = df.loc[mask, 'Temperature'].notnull() & df.loc[mask, 'Dew'].notnull()
+                    impute_mask_station = mask & missing_rh & has_temp_dew
+
+                    if impute_mask_station.sum() > 0:
+                        df.loc[impute_mask_station, flag_col] = 3
+                        calculated_rh = calculate_rh_from_temp_dew(
+                            df.loc[impute_mask_station, 'Temperature'],
+                            df.loc[impute_mask_station, 'Dew']
+                        )
+                        df.loc[impute_mask_station, col] = calculated_rh
+
+                after_tier3 = df[col].isnull().sum()
+                tier3_imputed = after_tier2 - after_tier3
+                logger.info(f"  Tier 3 (calc from T+Dew): Filled {tier3_imputed:,} values")
+            else:
+                after_tier3 = after_tier2
+        else:
+            after_tier3 = after_tier2
+
+        # Apply bounds checking
+        if col == 'Temperature':
+            out_of_bounds = (df[col] < CONFIG['TEMP_MIN']) | (df[col] > CONFIG['TEMP_MAX'])
+            if out_of_bounds.sum() > 0:
+                logger.warning(f"  Found {out_of_bounds.sum()} out-of-bounds temperatures, setting to NaN")
+                df.loc[out_of_bounds, col] = np.nan
+
+        elif col == 'Rh':
+            out_of_bounds = (df[col] < CONFIG['RH_MIN']) | (df[col] > CONFIG['RH_MAX'])
+            if out_of_bounds.sum() > 0:
+                logger.warning(f"  Found {out_of_bounds.sum()} out-of-bounds Rh values, clipping")
+                df[col] = df[col].clip(CONFIG['RH_MIN'], CONFIG['RH_MAX'])
+
+        elif col == 'Dew':
+            out_of_bounds = (df[col] < CONFIG['DEW_MIN']) | (df[col] > CONFIG['DEW_MAX'])
+            if out_of_bounds.sum() > 0:
+                logger.warning(f"  Found {out_of_bounds.sum()} out-of-bounds Dew values, setting to NaN")
+                df.loc[out_of_bounds, col] = np.nan
+                # Update imputation flags for removed values
+                df.loc[out_of_bounds, flag_col] = 0
+
+        # Final statistics
+        final_missing = df[col].isnull().sum()
+        total_imputed = original_missing - final_missing
+        imputation_rate = (total_imputed / original_missing * 100) if original_missing > 0 else 0
+
+        imputation_stats[col] = {
+            'original_missing': original_missing,
+            'original_pct': original_pct,
+            'tier1_imputed': tier1_imputed,
+            'tier2_imputed': tier2_imputed,
+            'tier3_imputed': tier3_imputed,
+            'total_imputed': total_imputed,
+            'final_missing': final_missing,
+            'final_pct': (final_missing / len(df)) * 100,
+            'imputation_rate': imputation_rate,
+            'stations_skipped': len(stations_to_skip)
+        }
+
+        logger.info(f"  RESULT: {original_missing:,} → {final_missing:,} missing "
+                   f"({imputation_rate:.1f}% imputed, {len(stations_to_skip)} stations skipped)")
+
+    # Summary report
+    logger.info("\n" + "="*60)
+    logger.info("IMPUTATION SUMMARY")
+    logger.info("="*60)
+
+    total_original = sum(s['original_missing'] for s in imputation_stats.values())
+    total_imputed = sum(s['total_imputed'] for s in imputation_stats.values())
+    total_remaining = sum(s['final_missing'] for s in imputation_stats.values())
+
+    logger.info(f"Total original missing values: {total_original:,}")
+
+    if total_original > 0:
+        imputation_pct = (total_imputed / total_original * 100)
+        logger.info(f"Successfully imputed: {total_imputed:,} ({imputation_pct:.1f}%)")
+        logger.info(f"Remaining missing: {total_remaining:,} (sensor failures or ≥{CONFIG['IMPUTATION_THRESHOLD_PCT']}% missing)")
+        logger.info("")
+        logger.info("By Method:")
+        tier1_total = sum(s['tier1_imputed'] for s in imputation_stats.values())
+        tier2_total = sum(s['tier2_imputed'] for s in imputation_stats.values())
+        tier3_total = sum(s['tier3_imputed'] for s in imputation_stats.values())
+        logger.info(f"  Tier 1 (Interpolation): {tier1_total:,}")
+        logger.info(f"  Tier 2 (Forward/Back Fill): {tier2_total:,}")
+        logger.info(f"  Tier 3 (Variable-Specific): {tier3_total:,}")
+    else:
+        logger.info("No missing values found - data is complete!")
+
+    logger.info("="*60 + "\n")
 
     return df
 
@@ -613,6 +1063,10 @@ def create_hourly_aggregates(df):
     ].copy()
 
     logger.info(f"Rows in time window: {len(hourly_data):,} of {len(df):,}")
+
+    # Drop imputation flag columns before aggregating
+    flag_cols = [c for c in hourly_data.columns if c.endswith('_imputed')]
+    hourly_data = hourly_data.drop(columns=flag_cols)
 
     # Group by station and hour
     grouped = hourly_data.groupby(['station', 'hour_label'], observed=True)
@@ -681,14 +1135,18 @@ def create_daily_aggregates(df):
     # Create date label (UTC date)
     df['date_label'] = df['Datetime_UTC'].dt.date
 
+    # Drop imputation flag columns before aggregating
+    flag_cols = [c for c in df.columns if c.endswith('_imputed')]
+    df_for_agg = df.drop(columns=flag_cols)
+
     # Build list of aggregations to perform
     agg_list = []
 
-    for col in df.columns:
+    for col in df_for_agg.columns:
         if col in ['station', 'date_label', 'Datetime_UTC']:
             continue
 
-        if not pd.api.types.is_numeric_dtype(df[col]):
+        if not pd.api.types.is_numeric_dtype(df_for_agg[col]):
             continue
 
         col_lower = col.lower()
@@ -696,18 +1154,18 @@ def create_daily_aggregates(df):
         # Special handling for specific columns
         if 'wind gust speed' in col_lower or 'gust speed' in col_lower:
             # Wind gust: daily maximum
-            agg_list.append(df.groupby(['station', 'date_label'], observed=True)[col].max().rename(col))
+            agg_list.append(df_for_agg.groupby(['station', 'date_label'], observed=True)[col].max().rename(col))
         elif 'rain' in col_lower or 'precipitation' in col_lower:
             # Rain: daily sum
-            agg_list.append(df.groupby(['station', 'date_label'], observed=True)[col].sum().rename(col))
+            agg_list.append(df_for_agg.groupby(['station', 'date_label'], observed=True)[col].sum().rename(col))
         elif 'wind direction' in col_lower or col == 'Wind Direction':
             # Wind direction: circular mean for the day
-            agg_list.append(df.groupby(['station', 'date_label'], observed=True)[col].agg(circular_mean_degrees).rename(col))
+            agg_list.append(df_for_agg.groupby(['station', 'date_label'], observed=True)[col].agg(circular_mean_degrees).rename(col))
         else:
             # For all other variables: min, max, and mean
-            agg_list.append(df.groupby(['station', 'date_label'], observed=True)[col].min().rename(f'{col}_min'))
-            agg_list.append(df.groupby(['station', 'date_label'], observed=True)[col].max().rename(f'{col}_max'))
-            agg_list.append(df.groupby(['station', 'date_label'], observed=True)[col].mean().rename(f'{col}_mean'))
+            agg_list.append(df_for_agg.groupby(['station', 'date_label'], observed=True)[col].min().rename(f'{col}_min'))
+            agg_list.append(df_for_agg.groupby(['station', 'date_label'], observed=True)[col].max().rename(f'{col}_max'))
+            agg_list.append(df_for_agg.groupby(['station', 'date_label'], observed=True)[col].mean().rename(f'{col}_mean'))
 
     # Combine all aggregations
     daily_aggregated = pd.concat(agg_list, axis=1).reset_index()
@@ -737,7 +1195,8 @@ def create_daily_aggregates(df):
 def main():
     """Main processing pipeline."""
     logger.info("="*60)
-    logger.info("Starting Weather Data Processing Pipeline")
+    logger.info("Starting Weather Data Processing Pipeline v2.5")
+    logger.info("With 25% Threshold + Data Quality + Dew Bounds Check")
     logger.info("="*60)
 
     try:
@@ -772,29 +1231,41 @@ def main():
         # Step 8: Generate quality report after cleaning
         generate_data_quality_report(all_weather_data, "After Cleaning")
 
-        # Step 9: Save all data
+        # Step 9: IMPUTE MISSING VALUES (with 25% threshold and Dew bounds)
+        all_weather_data = impute_missing_values(all_weather_data)
+
+        # Step 10: Generate quality report after imputation
+        generate_data_quality_report(all_weather_data, "After Imputation")
+
+        # Step 11: CREATE DATA QUALITY CSV REPORT (with statistics)
+        data_quality_report = create_data_quality_csv(all_weather_data)
+        quality_output = CONFIG['OUTPUT_DATA_QUALITY']
+        data_quality_report.to_csv(quality_output, index=False)
+        logger.info(f"Saved data quality report to: {quality_output}")
+
+        # Step 12: Save all data
         output_file = CONFIG['OUTPUT_ALL_DATA']
         all_weather_data.to_csv(output_file, index=False)
         logger.info(f"Saved all weather data to: {output_file}")
 
-        # Step 10: Create hourly aggregates
+        # Step 13: Create hourly aggregates
         hourly_aggregated = create_hourly_aggregates(all_weather_data)
 
-        # Step 11: Generate quality report for hourly data
+        # Step 14: Generate quality report for hourly data
         generate_data_quality_report(hourly_aggregated, "Hourly Aggregated")
 
-        # Step 12: Save hourly data
+        # Step 15: Save hourly data
         hourly_output = CONFIG['OUTPUT_HOURLY']
         hourly_aggregated.to_csv(hourly_output, index=False)
         logger.info(f"Saved hourly weather data to: {hourly_output}")
 
-        # Step 13: Create daily aggregates
+        # Step 16: Create daily aggregates
         daily_aggregated = create_daily_aggregates(all_weather_data)
 
-        # Step 14: Generate quality report for daily data
+        # Step 17: Generate quality report for daily data
         generate_data_quality_report(daily_aggregated, "Daily Aggregated")
 
-        # Step 15: Save daily data
+        # Step 18: Save daily data
         daily_output = CONFIG['OUTPUT_DAILY']
         daily_aggregated.to_csv(daily_output, index=False)
         logger.info(f"Saved daily weather data to: {daily_output}")
@@ -803,9 +1274,18 @@ def main():
         logger.info("Pipeline completed successfully!")
         logger.info("="*60)
         logger.info("\nOutput files:")
-        logger.info(f"  1. {output_file} - All raw data (cleaned)")
+        logger.info(f"  1. {output_file} - All raw data (cleaned + imputed)")
         logger.info(f"  2. {hourly_output} - Hourly aggregates")
         logger.info(f"  3. {daily_output} - Daily aggregates")
+        logger.info(f"  4. {quality_output} - Data quality report with statistics")
+        logger.info("\nNOTE: Imputation flags (*_imputed columns) saved in all_weather_data.csv")
+        logger.info("  0 = original data")
+        logger.info("  1 = interpolated (< 3 hours)")
+        logger.info("  2 = forward/backward filled (3-6 hours)")
+        logger.info("  3 = calculated or special method")
+        logger.info(f"\nIMPUTATION RULES:")
+        logger.info(f"  - Stations with ≥{CONFIG['IMPUTATION_THRESHOLD_PCT']}% missing data NOT imputed")
+        logger.info(f"  - Dew values outside [{CONFIG['DEW_MIN']}, {CONFIG['DEW_MAX']}] removed")
 
     except Exception as e:
         logger.error(f"Pipeline failed: {e}", exc_info=True)
