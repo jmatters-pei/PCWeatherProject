@@ -11,7 +11,7 @@ import os
 def get_csv_files(repo="jmatters-pei/PCWeatherProject", base_path="Data"):
     """Recursively fetch all CSV raw URLs from GitHub repo Data folder."""
     csv_urls = []
-
+    
     # Check for GitHub token in environment variable
     github_token = os.environ.get('GITHUB_TOKEN', None)
 
@@ -20,11 +20,11 @@ def get_csv_files(repo="jmatters-pei/PCWeatherProject", base_path="Data"):
         try:
             req = urllib.request.Request(url)
             req.add_header('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
-
+            
             # Add authentication if token is available
             if github_token:
                 req.add_header('Authorization', f'token {github_token}')
-
+            
             with urllib.request.urlopen(req, timeout=10) as resp:
                 return json.loads(resp.read().decode())
         except urllib.error.HTTPError as e:
@@ -59,7 +59,7 @@ def get_csv_files(repo="jmatters-pei/PCWeatherProject", base_path="Data"):
         print("Using GitHub token for authentication")
     else:
         print("No GitHub token found - using unauthenticated requests (limited to 60/hour)")
-
+    
     recurse_contents(base_path)
     return csv_urls
 
@@ -102,10 +102,10 @@ for raw_url, full_path in csv_files:
     dataframes.append(df)
 
 
-print(f"Loaded {len(dataframes)} files from GitHub")
+print(f"Loaded {len(dataframes)} files")
 
 # ============================================================================
-# ECCC STANHOPE WEATHER STATION DATA DOWNLOAD - WITH DEBUGGING
+# ECCC STANHOPE WEATHER STATION DATA DOWNLOAD
 # ============================================================================
 
 def download_eccc_stanhope_data():
@@ -114,59 +114,41 @@ def download_eccc_stanhope_data():
     ECCC times are in UTC.
     """
     import datetime
-
+    
     station_id = 6545  # Stanhope station
     current_year = datetime.datetime.now().year
     current_month = datetime.datetime.now().month
-
+    
     eccc_dataframes = []
-
-    print(f"\n=== DOWNLOADING ECCC STANHOPE DATA ===")
-    print(f"Station ID: {station_id}")
-    print(f"Date range: 2022-01 to {current_year}-{current_month:02d}")
-
+    
     # Download data from 2022 to current year
     for year in range(2022, current_year + 1):
         # Determine the last month to download for current year
         last_month = current_month if year == current_year else 12
-
+        
         for month in range(1, last_month + 1):
             url = f"https://climate.weather.gc.ca/climate_data/bulk_data_e.html?format=csv&stationID={station_id}&Year={year}&Month={month}&Day=14&timeframe=1&submit=Download+Data"
-
+            
             try:
                 req = urllib.request.Request(url)
                 req.add_header('User-Agent', 'Mozilla/5.0')
                 df = pd.read_csv(urllib.request.urlopen(req), encoding='utf-8', on_bad_lines='skip')
-
+                
                 if not df.empty:
                     df['station'] = 'Stanhope'
                     eccc_dataframes.append(df)
-                    print(f"  ✓ {year}-{month:02d}: {len(df)} rows, columns: {list(df.columns[:5])}...")
-                else:
-                    print(f"  ✗ {year}-{month:02d}: Empty dataframe")
-
+                
                 # Be polite to the server
                 time.sleep(0.5)
-
+                
             except Exception as e:
-                print(f"  ✗ {year}-{month:02d}: Error - {str(e)[:80]}")
                 continue
-
-    print(f"\nTotal ECCC dataframes downloaded: {len(eccc_dataframes)}")
-    if eccc_dataframes:
-        total_rows = sum(len(df) for df in eccc_dataframes)
-        print(f"Total ECCC rows: {total_rows}")
-        print(f"Sample columns from first dataframe: {list(eccc_dataframes[0].columns)}")
-    else:
-        print("WARNING: No ECCC data was downloaded!")
-
+    
     return eccc_dataframes
 
 # Download ECCC data and add to dataframes list
 eccc_dfs = download_eccc_stanhope_data()
 dataframes.extend(eccc_dfs)
-
-print(f"\nTotal dataframes after ECCC download: {len(dataframes)}")
 
 
 def clean_columns(df):
@@ -181,7 +163,7 @@ def clean_columns(df):
     df = df.drop(columns=[c for c in cols_to_drop if c in df.columns])
 
 
-    # Standard replacements - MORE COMPREHENSIVE
+    # Standard replacements
     def standardize(col):
         lower = str(col).lower().strip()
         replacements = {
@@ -217,7 +199,6 @@ def clean_columns(df):
 
 
 # Clean all
-print("\nCleaning columns...")
 cleaned_dfs = [clean_columns(df) for df in dataframes]
 gc.collect()
 
@@ -225,12 +206,9 @@ gc.collect()
 # Concat safely
 all_weather_data = pd.concat(cleaned_dfs, axis=0, ignore_index=True, sort=False)
 
-print(f"\nAfter concatenation: {all_weather_data.shape}")
-print(f"Stations: {all_weather_data['station'].value_counts()}")
-
 
 # Smart dupe merge
-print("\nShape pre-merge:", all_weather_data.shape)
+print("Shape pre-merge:", all_weather_data.shape)
 numeric_cols = all_weather_data.select_dtypes(include='number').columns
 non_datetime_numeric = [col for col in numeric_cols if not pd.api.types.is_datetime64_any_dtype(all_weather_data[col])]
 dupe_numeric = all_weather_data[non_datetime_numeric].columns[
@@ -239,34 +217,29 @@ dupe_numeric = all_weather_data[non_datetime_numeric].columns[
 
 
 if dupe_numeric:
-    print(f"Merging numeric dupes: {dupe_numeric}")
+    print(f"Merging dupes: {dupe_numeric}")
     for col in dupe_numeric:
         dup_cols = [c for c in all_weather_data.columns if c == col]
         if len(dup_cols) > 1:
             all_weather_data[col] = all_weather_data[dup_cols].bfill(axis=1).iloc[:, 0]
-
+    
     all_weather_data = all_weather_data.loc[:, ~all_weather_data.columns.duplicated(keep='first')]
-
-print(f"After numeric merge: {all_weather_data.shape}")
 
 
 # Handle Date/Time column from ECCC Stanhope
 if 'Date/Time' in all_weather_data.columns:
-    print("\nProcessing Date/Time column...")
     date_time_parsed = pd.to_datetime(all_weather_data['Date/Time'], utc=True, errors='coerce')
-
+    
     if 'Datetime_UTC' in all_weather_data.columns:
         all_weather_data['Datetime_UTC'] = all_weather_data['Datetime_UTC'].fillna(date_time_parsed)
     else:
         all_weather_data['Datetime_UTC'] = date_time_parsed
-
+    
     all_weather_data = all_weather_data.drop(columns=['Date/Time'])
-    print("Converted Date/Time to Datetime_UTC format")
 
 # Convert Datetime_UTC column to proper datetime if it exists
 if 'Datetime_UTC' in all_weather_data.columns:
     all_weather_data['Datetime_UTC'] = pd.to_datetime(all_weather_data['Datetime_UTC'], utc=True, errors='coerce')
-    print(f"Ensured Datetime_UTC is in UTC format")
 
 # MERGE Date+Time columns to Datetime_UTC
 date_cols = [c for c in all_weather_data.columns if 'date' in str(c).lower() and c != 'Datetime_UTC']
@@ -275,20 +248,20 @@ time_cols = [c for c in all_weather_data.columns if 'time' in str(c).lower() and
 
 if date_cols and time_cols:
     date_col, time_col = date_cols[0], time_cols[0]
-
+    
     datetime_combined = all_weather_data[date_col].astype(str) + ' ' + all_weather_data[time_col].astype(str)
     temp_datetime = pd.to_datetime(datetime_combined, utc=True, errors='coerce')
-
+    
     if 'Datetime_UTC' in all_weather_data.columns:
         all_weather_data['Datetime_UTC'] = all_weather_data['Datetime_UTC'].fillna(temp_datetime)
     else:
         all_weather_data['Datetime_UTC'] = temp_datetime
-
+    
     all_weather_data = all_weather_data.drop(columns=[date_col, time_col])
     print(f"Merged Date+Time columns into Datetime_UTC")
 
 all_weather_data = all_weather_data.sort_values('Datetime_UTC').reset_index(drop=True)
-print(f"Total rows after datetime processing: {len(all_weather_data)}")
+print(f"Created Datetime_UTC, kept {len(all_weather_data)} data rows")
 
 
 # Drop Hmdx and Wind Chill columns
@@ -302,7 +275,6 @@ if dropped_hmdx:
 # Drop Day column if it exists
 if 'Day' in all_weather_data.columns:
     all_weather_data = all_weather_data.drop(columns=['Day'])
-    print("Dropped Day column")
 
 
 # Drop rows with only station + Datetime_UTC
@@ -345,15 +317,14 @@ all_weather_data[float_cols] = all_weather_data[float_cols].apply(pd.to_numeric,
 all_weather_data['station'] = all_weather_data['station'].astype('category')
 
 
-print(f"\nFinal: {all_weather_data.shape}")
+print(f"Final: {all_weather_data.shape}")
 print(f"Memory: {all_weather_data.memory_usage(deep=True).sum()/1e6:.1f} MB")
-print("Stations:")
-print(all_weather_data['station'].value_counts())
-print("\nColumns:", list(all_weather_data.columns))
+print("Stations:", all_weather_data['station'].value_counts().head())
+print("Columns:", list(all_weather_data.columns))
 
 
 all_weather_data.to_csv('PEINP_all_weather_data.csv', index=False)
-print("\nSaved PEINP_all_weather_data.csv!")
+print("Saved!")
 
 
 # ============================================================================
@@ -368,16 +339,16 @@ def circular_mean_degrees(angles):
     angles = angles.dropna()
     if len(angles) == 0:
         return np.nan
-
+    
     angles_rad = np.deg2rad(angles)
     sin_mean = np.sin(angles_rad).mean()
     cos_mean = np.cos(angles_rad).mean()
     mean_angle_rad = np.arctan2(sin_mean, cos_mean)
     mean_angle_deg = np.rad2deg(mean_angle_rad)
-
+    
     if mean_angle_deg < 0:
         mean_angle_deg += 360
-
+    
     return mean_angle_deg
 
 
@@ -420,13 +391,13 @@ agg_dict = {}
 for col in hourly_data.columns:
     if col in ['station', 'hour_label', 'Datetime_UTC', 'minutes_from_hour']:
         continue
-
+    
     # Skip non-numeric columns
     if not pd.api.types.is_numeric_dtype(hourly_data[col]):
         continue
-
+    
     col_lower = col.lower()
-
+    
     if 'wind gust speed' in col_lower or 'gust speed' in col_lower:
         agg_dict[col] = 'max'
     elif 'precipitation' in col_lower:
@@ -451,12 +422,10 @@ col_order = ['Datetime_UTC', 'station'] + [c for c in hourly_aggregated.columns
                                             if c not in ['Datetime_UTC', 'station']]
 hourly_aggregated = hourly_aggregated[col_order]
 
-print(f"\nHourly aggregated shape: {hourly_aggregated.shape}")
+print(f"Hourly aggregated shape: {hourly_aggregated.shape}")
 print(f"Date range: {hourly_aggregated['Datetime_UTC'].min()} to {hourly_aggregated['Datetime_UTC'].max()}")
 print(f"Stations: {hourly_aggregated['station'].nunique()}")
-print("\nStation counts in hourly data:")
-print(hourly_aggregated['station'].value_counts())
 
 # Save to CSV
 hourly_aggregated.to_csv('PEINP_hourly_weather_data.csv', index=False)
-print("\nSaved hourly data to 'PEINP_hourly_weather_data.csv'!")
+print("Saved hourly data to 'PEINP_hourly_weather_data.csv'!")
