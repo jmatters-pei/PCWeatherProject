@@ -28,6 +28,7 @@ CONFIG = {
     'GITHUB_BASE_PATH': 'Data',
     'OUTPUT_ALL_DATA': 'PEINP_all_weather_data.csv',
     'OUTPUT_HOURLY': 'PEINP_hourly_weather_data.csv',
+    'OUTPUT_DAILY': 'PEINP_daily_weather_data.csv',
     'CACHE_DIR': 'cache',
     'MAX_WORKERS': 4
 }
@@ -561,7 +562,7 @@ def clean_weather_data(df):
     return df
 
 # ============================================================================
-# HOURLY AGGREGATION
+# AGGREGATION FUNCTIONS
 # ============================================================================
 
 def circular_mean_degrees(angles):
@@ -653,6 +654,82 @@ def create_hourly_aggregates(df):
 
     return hourly_aggregated
 
+def create_daily_aggregates(df):
+    """
+    Create daily aggregated weather data with min, max, and mean statistics.
+    Uses pd.concat() for mixed aggregation types.
+
+    Args:
+        df: DataFrame with weather data (must have Datetime_UTC and station columns)
+
+    Returns:
+        DataFrame with daily aggregates
+    """
+    logger.info("Creating daily aggregates...")
+
+    # Ensure Datetime_UTC is datetime type
+    df['Datetime_UTC'] = pd.to_datetime(df['Datetime_UTC'], utc=True)
+
+    # Convert all numeric columns
+    numeric_cols_to_fix = df.select_dtypes(include=['object']).columns
+    numeric_cols_to_fix = [col for col in numeric_cols_to_fix 
+                          if col not in ['station', 'Datetime_UTC']]
+
+    for col in numeric_cols_to_fix:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    # Create date label (UTC date)
+    df['date_label'] = df['Datetime_UTC'].dt.date
+
+    # Build list of aggregations to perform
+    agg_list = []
+
+    for col in df.columns:
+        if col in ['station', 'date_label', 'Datetime_UTC']:
+            continue
+
+        if not pd.api.types.is_numeric_dtype(df[col]):
+            continue
+
+        col_lower = col.lower()
+
+        # Special handling for specific columns
+        if 'wind gust speed' in col_lower or 'gust speed' in col_lower:
+            # Wind gust: daily maximum
+            agg_list.append(df.groupby(['station', 'date_label'], observed=True)[col].max().rename(col))
+        elif 'rain' in col_lower or 'precipitation' in col_lower:
+            # Rain: daily sum
+            agg_list.append(df.groupby(['station', 'date_label'], observed=True)[col].sum().rename(col))
+        elif 'wind direction' in col_lower or col == 'Wind Direction':
+            # Wind direction: circular mean for the day
+            agg_list.append(df.groupby(['station', 'date_label'], observed=True)[col].agg(circular_mean_degrees).rename(col))
+        else:
+            # For all other variables: min, max, and mean
+            agg_list.append(df.groupby(['station', 'date_label'], observed=True)[col].min().rename(f'{col}_min'))
+            agg_list.append(df.groupby(['station', 'date_label'], observed=True)[col].max().rename(f'{col}_max'))
+            agg_list.append(df.groupby(['station', 'date_label'], observed=True)[col].mean().rename(f'{col}_mean'))
+
+    # Combine all aggregations
+    daily_aggregated = pd.concat(agg_list, axis=1).reset_index()
+
+    # Convert date_label back to datetime for consistency
+    daily_aggregated['Datetime_UTC'] = pd.to_datetime(daily_aggregated['date_label'])
+    daily_aggregated = daily_aggregated.drop(columns=['date_label'])
+
+    # Round numeric columns to 2 decimal places
+    numeric_columns = daily_aggregated.select_dtypes(include=[np.number]).columns
+    daily_aggregated[numeric_columns] = daily_aggregated[numeric_columns].round(2)
+
+    # Reorder columns
+    col_order = ['Datetime_UTC', 'station'] + [c for c in daily_aggregated.columns 
+                                                if c not in ['Datetime_UTC', 'station']]
+    daily_aggregated = daily_aggregated[col_order]
+
+    logger.info(f"Daily aggregation complete: {daily_aggregated.shape}")
+    logger.info(f"Date range: {daily_aggregated['Datetime_UTC'].min()} to {daily_aggregated['Datetime_UTC'].max()}")
+
+    return daily_aggregated
+
 # ============================================================================
 # MAIN PIPELINE
 # ============================================================================
@@ -711,9 +788,24 @@ def main():
         hourly_aggregated.to_csv(hourly_output, index=False)
         logger.info(f"Saved hourly weather data to: {hourly_output}")
 
+        # Step 13: Create daily aggregates
+        daily_aggregated = create_daily_aggregates(all_weather_data)
+
+        # Step 14: Generate quality report for daily data
+        generate_data_quality_report(daily_aggregated, "Daily Aggregated")
+
+        # Step 15: Save daily data
+        daily_output = CONFIG['OUTPUT_DAILY']
+        daily_aggregated.to_csv(daily_output, index=False)
+        logger.info(f"Saved daily weather data to: {daily_output}")
+
         logger.info("="*60)
         logger.info("Pipeline completed successfully!")
         logger.info("="*60)
+        logger.info("\nOutput files:")
+        logger.info(f"  1. {output_file} - All raw data (cleaned)")
+        logger.info(f"  2. {hourly_output} - Hourly aggregates")
+        logger.info(f"  3. {daily_output} - Daily aggregates")
 
     except Exception as e:
         logger.error(f"Pipeline failed: {e}", exc_info=True)
